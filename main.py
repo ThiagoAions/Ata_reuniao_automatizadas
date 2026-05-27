@@ -27,6 +27,12 @@ from schemas.requests import (
     ProtocoloForense,
     MetadadosForenses,
 )
+from schemas.cadastro import (
+    CadastroFaceRequest,
+    CadastroFaceResponse,
+    ValidacaoSimplesRequest,
+    ValidacaoSimplesResponse,
+)
 
 # -- Carrega variaveis de ambiente (.env) ------------------------------------
 load_dotenv()
@@ -101,9 +107,9 @@ def health_check():
     """
     return {
         "status": "online",
-        "motor": "OpenCV_Haar+LBPH",
+        "motor": engine.active_engine if engine else "none",
         "modelo_carregado": engine.is_loaded if engine else False,
-        "funcionarios_cadastrados": len(engine.label_map) if engine else 0,
+        "funcionarios_cadastrados": len(set(engine.fr_names)) if engine and engine.active_engine == 'face_recognition' else len(engine.label_map) if engine else 0,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -203,6 +209,208 @@ def validar_assinatura(
         sucesso=True,
         protocolo=protocolo,
         erro=None,
+    )
+
+
+# ============================================================================
+# ENDPOINT: Verificação prévia de rosto (qualidade)
+# ============================================================================
+
+@app.post(
+    "/verificar_rosto",
+    tags=["Cadastro"],
+    summary="Verifica se a imagem tem um rosto frontal claro antes do cadastro",
+)
+def verificar_rosto(req: ValidacaoSimplesRequest):
+    """
+    Endpoint de pré-validação -- checa qualidade do rosto ANTES do cadastro.
+    Retorna detalhes sobre a detecção para o frontend mostrar feedback.
+    """
+    if engine is None:
+        return {
+            "rosto_detectado": False,
+            "qualidade": "erro",
+            "mensagem": "Motor de IA não inicializado.",
+        }
+
+    try:
+        rgb = engine._decode_base64_image(req.imagem_base64)
+    except Exception as e:
+        return {
+            "rosto_detectado": False,
+            "qualidade": "erro",
+            "mensagem": f"Erro ao decodificar imagem: {e}",
+        }
+
+    import face_recognition as _fr
+
+    # Detecta faces usando face_recognition (mais preciso que Haar)
+    if _fr is not None:
+        try:
+            locs = _fr.face_locations(rgb, model='hog')
+        except Exception:
+            locs = []
+    else:
+        boxes = engine._detect_faces_boxes(rgb)
+        # Converte formato (x1,y1,x2,y2) -> face_recognition (top,right,bottom,left)
+        locs = [(y1, x2, y2, x1) for (x1, y1, x2, y2) in boxes]
+
+    if not locs:
+        return {
+            "rosto_detectado": False,
+            "qualidade": "ruim",
+            "mensagem": "Nenhum rosto detectado. Posicione o rosto de frente para a câmera, com boa iluminação.",
+            "faces_encontradas": 0,
+        }
+
+    # Verifica qualidade: tamanho do rosto relativo à imagem
+    h_img, w_img = rgb.shape[:2]
+    top, right, bottom, left = locs[0]
+    face_w = right - left
+    face_h = bottom - top
+    face_area = face_w * face_h
+    img_area = h_img * w_img
+    face_ratio = face_area / img_area if img_area > 0 else 0
+
+    # O rosto deve ocupar pelo menos 3% da imagem
+    if face_ratio < 0.03:
+        return {
+            "rosto_detectado": True,
+            "qualidade": "ruim",
+            "mensagem": "Rosto muito pequeno ou distante. Aproxime-se da câmera.",
+            "faces_encontradas": len(locs),
+            "tamanho_rosto_percent": round(face_ratio * 100, 1),
+        }
+
+    # Verifica se o rosto tem tamanho mínimo absoluto (80x80 pixels)
+    if face_w < 80 or face_h < 80:
+        return {
+            "rosto_detectado": True,
+            "qualidade": "ruim",
+            "mensagem": "Resolução do rosto muito baixa. Aproxime-se mais da câmera.",
+            "faces_encontradas": len(locs),
+            "tamanho_rosto_px": f"{face_w}x{face_h}",
+        }
+
+    # Tudo OK
+    qualidade = "boa" if face_ratio >= 0.08 else "aceitavel"
+    return {
+        "rosto_detectado": True,
+        "qualidade": qualidade,
+        "mensagem": "Rosto detectado com qualidade adequada.",
+        "faces_encontradas": len(locs),
+        "tamanho_rosto_percent": round(face_ratio * 100, 1),
+    }
+
+
+# ============================================================================
+# ENDPOINT: Cadastro de Face
+# ============================================================================
+
+@app.post(
+    "/cadastrar_face",
+    response_model=CadastroFaceResponse,
+    tags=["Cadastro"],
+    summary="Cadastra uma nova face de colaborador e retreina o modelo",
+)
+def cadastrar_face(req: CadastroFaceRequest):
+    """
+    Endpoint de cadastro facial -- usado pelo frontend CadastroBiometria.
+
+    Fluxo:
+      1. Valida qualidade do rosto (tamanho, frontalidade)
+      2. Decodifica imagem base64
+      3. Detecta face e salva em employees/{nome}/
+      4. Retreina o modelo face_recognition/LBPH
+      5. Hot-reload do modelo no motor de IA
+      6. Retorna JSON com resultado
+    """
+    if engine is None:
+        return CadastroFaceResponse(
+            sucesso=False,
+            detail="Motor de IA nao inicializado.",
+        )
+
+    # 1. Cadastra a face (detecta + salva)
+    resultado = engine.cadastrar_face(
+        nome=req.nome,
+        imagem_base64=req.imagem_base64,
+    )
+
+    if not resultado["sucesso"]:
+        return CadastroFaceResponse(
+            sucesso=False,
+            detail=resultado["erro"],
+        )
+
+    print(f"[OK] Face salva: {resultado['nome']} ({resultado['total_fotos']} fotos)")
+
+    # 2. Retreina com todas as fotos
+    print("[*] Retreinando modelo...")
+    treino = engine.treinar_e_recarregar()
+
+    if not treino["sucesso"]:
+        return CadastroFaceResponse(
+            sucesso=True,
+            mensagem=(
+                f"Foto de {resultado['nome']} salva com sucesso "
+                f"({resultado['total_fotos']} fotos), "
+                f"mas o retreinamento falhou: {treino['erro']}"
+            ),
+            funcionarios_total=0,
+        )
+
+    return CadastroFaceResponse(
+        sucesso=True,
+        mensagem=(
+            f"Rosto de {resultado['nome']} cadastrado e modelo retreinado! "
+            f"({treino['funcionarios']} funcionarios, {treino['faces']} faces)"
+        ),
+        funcionarios_total=treino["funcionarios"],
+    )
+
+
+# ============================================================================
+# ENDPOINT: Validacao Facial Simples (usado pelo frontend da Ata)
+# ============================================================================
+
+@app.post(
+    "/validar_face_simples",
+    response_model=ValidacaoSimplesResponse,
+    tags=["Validacao Facial"],
+    summary="Validacao facial simples (sem protocolo forense)",
+)
+def validar_face_simples(req: ValidacaoSimplesRequest):
+    """
+    Endpoint simplificado -- usado diretamente pelo frontend da Ata.
+    Nao requer autenticacao Bearer.
+    Retorna apenas: match (bool), nome, confianca.
+    """
+    if engine is None or not engine.is_loaded:
+        return ValidacaoSimplesResponse(
+            match=False,
+            erro="Motor de IA nao carregado. Cadastre funcionarios primeiro.",
+        )
+
+    resultado = engine.identificar(req.imagem_base64)
+
+    # Limpa pixels da face da memoria
+    if resultado.get("face_pixels") is not None:
+        del resultado["face_pixels"]
+    gc.collect()
+
+    if not resultado["identificado"]:
+        return ValidacaoSimplesResponse(
+            match=False,
+            nome=resultado.get("nome"),
+            confianca=resultado.get("confianca", 0.0),
+            erro=resultado.get("erro") or "Rosto nao identificado.",
+        )
+
+    return ValidacaoSimplesResponse(
+        match=True,
+        nome=resultado["nome"],
+        confianca=resultado["confianca"],
     )
 
 
