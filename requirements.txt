@@ -8,8 +8,11 @@ fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 python-multipart>=0.0.6
 
-# Motor de IA (face_recognition + OpenCV fallback)
-face-recognition>=1.3.0
+# Motor de IA (OpenCV fallback)
+# NOTA: dlib-bin, face-recognition-models e face-recognition são instalados
+# diretamente no Dockerfile para evitar compilação demorada do dlib.
+# Se precisar rodar localmente, instale-os manualmente:
+# pip install dlib-bin face-recognition-models face-recognition
 opencv-contrib-python-headless>=4.8.0
 numpy>=1.24.0
 Pillow>=10.0.0

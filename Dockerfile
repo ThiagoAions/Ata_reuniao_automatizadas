@@ -9,7 +9,7 @@ FROM python:3.11-slim
 # Dependências de sistema para OpenCV headless
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        libgl1-mesa-glx \
+        libgl1 \
         libglib2.0-0 \
         libsm6 \
         libxext6 \
@@ -21,6 +21,11 @@ WORKDIR /app
 
 # Instala dependências Python (cache layer)
 COPY requirements.txt .
+# 1. Instala dlib pré-compilado + modelos ANTES do face-recognition
+RUN pip install --no-cache-dir dlib-bin face-recognition-models
+# 2. Instala face-recognition SEM suas dependências (evita recompilar dlib)
+RUN pip install --no-cache-dir --no-deps face-recognition
+# 3. Instala o resto normalmente
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copia código-fonte e modelos treinados
